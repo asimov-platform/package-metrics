@@ -1,0 +1,38 @@
+name: Daily Package Downloads
+
+on:
+  # At 00:00 UTC every day – https://crontab.guru/#0_0_*_*_*
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  collect-downloads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -U pip
+          pip install requests playwright
+          playwright install chromium
+
+      - name: Run download script
+        run: python collect_downloads.py
+
+      - name: Upload CSV to Supabase
+        run: |
+          python upload_to_supabase.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
