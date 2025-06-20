@@ -1,3 +1,5 @@
+import os
+
 from playwright.sync_api import sync_playwright
 import requests
 import csv
@@ -5,7 +7,6 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from operator import itemgetter
-from pathlib import Path
 
 
 def get_today_filename():
@@ -18,30 +19,16 @@ def get_yesterday_filename():
 
 
 def fetch_previous_downloads():
-    filename = f"downloads-{(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')}.csv"
-    filepath = Path(filename)
-
-    if not filepath.exists():
-        print(f"⚠️ Previous file not found: {filename}")
+    url = f"{os.environ['SUPABASE_URL']}/storage/v1/object/public/{os.environ['SUPABASE_BUCKET']}/{get_yesterday_filename()}"
+    headers = {"Authorization": f"Bearer {os.environ['SUPABASE_KEY']}"}
+    r = requests.get(url, headers=headers)
+    if not r.ok:
+        print(f"⚠️ Couldn't fetch previous file: {r.status_code}")
         return {}
 
-    with filepath.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return {(row["source"], row["owner"], row["name"]): int(row["downloads"]) for row in reader}
-
-
-
-# def fetch_previous_downloads():
-#     url = f"{os.environ['SUPABASE_URL']}/storage/v1/object/public/{os.environ['SUPABASE_BUCKET']}/{get_yesterday_filename()}"
-#     headers = {"Authorization": f"Bearer {os.environ['SUPABASE_KEY']}"}
-#     r = requests.get(url, headers=headers)
-#     if not r.ok:
-#         print(f"⚠️ Couldn't fetch previous file: {r.status_code}")
-#         return {}
-#
-#     lines = r.text.splitlines()
-#     reader = csv.DictReader(lines)
-#     return {(row["source"], row["owner"], row["name"]): int(row["downloads"]) for row in reader}
+    lines = r.text.splitlines()
+    reader = csv.DictReader(lines)
+    return {(row["source"], row["owner"], row["name"]): int(row["downloads"]) for row in reader}
 
 
 def fetch_pypistats_downloads(name):
@@ -49,10 +36,11 @@ def fetch_pypistats_downloads(name):
     try:
         r = requests.get(url, headers={"Accept": "application/json"}, timeout=5)
         if r.ok:
-            return r.json()["data"]["last_day"]
+            stats = r.json()["data"]
+            return stats.get("last_day", 0), stats.get("last_month", 0)
     except Exception:
         pass
-    return 0
+    return 0, 0
 
 
 def fetch_crates_downloads(crate):
@@ -93,8 +81,9 @@ def fetch_pypi_data(users, page):
         futures = {executor.submit(fetch_pypistats_downloads, pkg["name"]): pkg for pkg in packages}
         for future in as_completed(futures):
             pkg = futures[future]
-            pkg["daily_downloads"] = future.result()
-            pkg["downloads"] = None  # total not available via this API
+            daily, monthly = future.result()
+            pkg["daily_downloads"] = daily
+            pkg["downloads"] = monthly
     return packages
 
 
@@ -170,11 +159,17 @@ def fetch_crates_data(team_url):
 def compute_deltas(data, prev_downloads):
     for row in data:
         key = (row["source"], row["owner"], row["name"])
-        if row["source"] == "pypi":
-            continue
-        prev = prev_downloads.get(key, 0)
         current = int(row.get("downloads") or 0)
-        row["daily_downloads"] = max(current - prev, 0)
+        prev = prev_downloads.get(key)
+
+        if row["source"] == "pypi":
+            if prev is None:
+                pass
+            else:
+                current = prev + int(row.get("daily_downloads") or 0)
+                row["downloads"] = current
+        else:
+            row["daily_downloads"] = max(current - prev, 0) if prev is not None else 0
     return data
 
 
