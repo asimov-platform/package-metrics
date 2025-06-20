@@ -8,6 +8,10 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from operator import itemgetter
 
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+BUCKET = os.environ.get("SUPABASE_BUCKET", "downloads")
+
 
 def get_today_filename():
     return f"downloads-{datetime.now().strftime('%Y-%m-%d')}.csv"
