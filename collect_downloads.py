@@ -37,13 +37,20 @@ def fetch_previous_downloads():
 
 def fetch_pypistats_downloads(name):
     url = f"https://pypistats.org/api/packages/{name}/recent"
-    try:
-        r = requests.get(url, headers={"Accept": "application/json"}, timeout=5)
-        if r.ok:
-            stats = r.json()["data"]
-            return stats.get("last_day", 0), stats.get("last_month", 0)
-    except Exception:
-        pass
+    retries = 3
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers={"Accept": "application/json"}, timeout=5)
+            if r.ok:
+                stats = r.json().get("data", {})
+                daily = stats.get("last_day", 0)
+                monthly = stats.get("last_month", 0)
+                if daily > 0 or monthly > 0:
+                    return daily, monthly
+        except Exception:
+            pass
+        time.sleep(1 + attempt * 0.5)  # exponential backoff
+
     return 0, 0
 
 
