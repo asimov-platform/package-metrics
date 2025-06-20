@@ -14,7 +14,7 @@ def main():
     with open(filename, "rb") as f:
         content = f.read()
 
-    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{filename}"
+    url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{filename}?upsert=true"
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "text/csv"
