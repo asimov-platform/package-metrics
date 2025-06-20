@@ -1,4 +1,4 @@
-run-name: Daily Package Downloads — ${{ github.run_started_at }}
+name: Daily Package Downloads
 
 on:
   # At 00:00 UTC every day – https://crontab.guru/#0_0_*_*_*
