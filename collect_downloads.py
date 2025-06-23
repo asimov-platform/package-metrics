@@ -1,5 +1,4 @@
 import os
-
 from playwright.sync_api import sync_playwright
 import requests
 import csv
@@ -23,8 +22,8 @@ def get_yesterday_filename():
 
 
 def fetch_previous_downloads():
-    url = f"{os.environ['SUPABASE_URL']}/storage/v1/object/public/{os.environ['SUPABASE_BUCKET']}/{get_yesterday_filename()}"
-    headers = {"Authorization": f"Bearer {os.environ['SUPABASE_KEY']}"}
+    url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{get_yesterday_filename()}"
+    headers = {"Authorization": f"Bearer {SUPABASE_KEY}"}
     r = requests.get(url, headers=headers)
     if not r.ok:
         print(f"⚠️ Couldn't fetch previous file: {r.status_code}")
@@ -49,8 +48,7 @@ def fetch_pypistats_downloads(name):
                     return daily, monthly
         except Exception:
             pass
-        time.sleep(1 + attempt * 0.5)  # exponential backoff
-
+        time.sleep(1 + attempt * 0.5)
     return 0, 0
 
 
@@ -118,43 +116,47 @@ def fetch_rubygems_data(users):
     return results
 
 
-def fetch_crates_data(team_url):
+def fetch_crates_data(users):
     results = []
     seen = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page_num = 1
 
-        while True:
-            url = team_url if page_num == 1 else f"{team_url}?page={page_num}"
-            print(f"🔄 Crates.io: {url}")
-            try:
-                page.goto(url, wait_until="networkidle", timeout=10000)
-                page.wait_for_selector("a[href^='/crates/']", timeout=5000)
-            except Exception:
-                print("⚠️ Page load or selector timeout.")
-                break
+        for user in users:
+            page_num = 1
+            while True:
+                url = f"https://crates.io/teams/github:{user}:rust"
+                if page_num > 1:
+                    url += f"?page={page_num}"
 
-            crates = page.eval_on_selector_all(
-                "a[href^='/crates/']",
-                "els => els.map(e => e.innerText.trim())"
-            )
+                print(f"🔄 Crates.io user: {user} | Page: {page_num}")
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=10000)
+                    page.wait_for_selector("a[href^='/crates/']", timeout=5000)
+                except Exception:
+                    print("⚠️ Page load or selector timeout.")
+                    break
 
-            new_crates = [c for c in crates if c and c not in seen]
-            if not new_crates:
-                break
+                crates = page.eval_on_selector_all(
+                    "a[href^='/crates/']",
+                    "els => els.map(e => e.innerText.trim())"
+                )
 
-            for name in new_crates:
-                seen.add(name)
-                results.append({
-                    "source": "crates",
-                    "owner": "asimov-modules",
-                    "name": name
-                })
+                new_crates = [c for c in crates if c and c not in seen]
+                if not new_crates:
+                    break
 
-            page_num += 1
+                for name in new_crates:
+                    seen.add(name)
+                    results.append({
+                        "source": "crates",
+                        "owner": user,
+                        "name": name
+                    })
+
+                page_num += 1
 
         browser.close()
 
@@ -174,9 +176,7 @@ def compute_deltas(data, prev_downloads):
         prev = prev_downloads.get(key)
 
         if row["source"] == "pypi":
-            if prev is None:
-                pass
-            else:
+            if prev is not None:
                 current = prev + int(row.get("daily_downloads") or 0)
                 row["downloads"] = current
         else:
@@ -193,7 +193,6 @@ def write_csv(data, filename):
 
 def main():
     users = ["asimov-platform", "asimov-modules"]
-    crates_team_url = "https://crates.io/teams/github:asimov-modules:rust"
     all_data = []
 
     prev_downloads = fetch_previous_downloads()
@@ -212,7 +211,7 @@ def main():
         browser.close()
 
     all_data.extend(fetch_rubygems_data(users))
-    all_data.extend(fetch_crates_data(crates_team_url))
+    all_data.extend(fetch_crates_data(users))
     compute_deltas(all_data, prev_downloads)
     all_data.sort(key=itemgetter("source", "owner", "name"))
 
