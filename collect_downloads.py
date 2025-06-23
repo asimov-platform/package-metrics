@@ -6,10 +6,12 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from operator import itemgetter
+from github import Github
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 BUCKET = os.environ.get("SUPABASE_BUCKET", "downloads")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 
 def get_today_filename():
@@ -44,8 +46,7 @@ def fetch_pypistats_downloads(name):
                 stats = r.json().get("data", {})
                 daily = stats.get("last_day", 0)
                 monthly = stats.get("last_month", 0)
-                if daily > 0 or monthly > 0:
-                    return daily, monthly
+                return daily, monthly
         except Exception:
             pass
         time.sleep(1 + attempt * 0.5)
@@ -169,6 +170,31 @@ def fetch_crates_data(users):
     return results
 
 
+def fetch_github_release_downloads(token, orgs):
+    gh = Github(token)
+    entries = []
+
+    for org in orgs:
+        print(f"🔍 GitHub org: {org}")
+        for repo in gh.get_organization(org).get_repos():
+            total_dl = 0
+            try:
+                for release in repo.get_releases():
+                    for asset in release.get_assets():
+                        total_dl += asset.download_count
+                entries.append({
+                    "source": "github",
+                    "owner": org,
+                    "name": repo.name,
+                    "downloads": total_dl,
+                    "daily_downloads": None
+                })
+            except Exception as e:
+                print(f"⚠️ Skipped {repo.full_name}: {e}")
+
+    return entries
+
+
 def compute_deltas(data, prev_downloads):
     for row in data:
         key = (row["source"], row["owner"], row["name"])
@@ -212,6 +238,8 @@ def main():
 
     all_data.extend(fetch_rubygems_data(users))
     all_data.extend(fetch_crates_data(users))
+    all_data.extend(fetch_github_release_downloads(GITHUB_TOKEN, users))
+
     compute_deltas(all_data, prev_downloads)
     all_data.sort(key=itemgetter("source", "owner", "name"))
 

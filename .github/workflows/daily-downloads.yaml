@@ -32,6 +32,8 @@ jobs:
           playwright install chromium
 
       - name: Run download script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python collect_downloads.py
 
       - name: Upload CSV to Supabase
