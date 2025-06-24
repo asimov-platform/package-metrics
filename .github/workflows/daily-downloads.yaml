@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -U pip
-          pip install requests playwright github
+          pip install requests playwright PyGithub
           playwright install chromium
 
       - name: Run download script
