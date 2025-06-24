@@ -9,6 +9,7 @@ import requests
 from github import Github
 from playwright.sync_api import sync_playwright
 from supabase import create_client, Client
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Configure logging
 logging.basicConfig(
@@ -16,7 +17,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 # Configuration
 class Config:
@@ -30,18 +30,15 @@ class Config:
     SELECTOR_TIMEOUT = 5000
     MAX_WORKERS = 8
 
-
 # Type aliases
 PackageKey = Tuple[str, str, str]  # (source, owner, name)
 PackageData = Dict[str, any]
-
 
 def initialize_supabase() -> Client:
     """Initialize and return Supabase client."""
     if not Config.SUPABASE_URL or not Config.SUPABASE_KEY:
         raise ValueError("Supabase URL and Key must be set in environment variables")
     return create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
-
 
 def fetch_latest_downloads_map(supabase: Client) -> Dict[PackageKey, int]:
     """Fetch yesterday's download counts from Supabase."""
@@ -51,7 +48,7 @@ def fetch_latest_downloads_map(supabase: Client) -> Dict[PackageKey, int]:
             .select("*") \
             .eq("collected_at", yesterday) \
             .execute()
-
+        logger.info(f"Fetched {len(response.data)} rows from Supabase for {yesterday}")
         return {
             (row["source"], row["owner"], row["name"]): int(row["downloads"])
             for row in response.data
@@ -60,40 +57,36 @@ def fetch_latest_downloads_map(supabase: Client) -> Dict[PackageKey, int]:
         logger.error(f"Failed to fetch latest downloads: {e}")
         return {}
 
-
+@retry(
+    stop=stop_after_attempt(Config.MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((requests.RequestException, ValueError))
+)
 def fetch_pypistats_downloads(name: str) -> Tuple[int, int]:
     """Fetch PyPI download statistics for a package."""
     url = f"https://pypistats.org/api/packages/{name}/recent"
-    for attempt in range(Config.MAX_RETRIES):
-        try:
-            response = requests.get(
-                url,
-                headers={"Accept": "application/json"},
-                timeout=Config.REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            stats = response.json().get("data", {})
-            return stats.get("last_day", 0), stats.get("last_month", 0)
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed for PyPI stats {name}: {e}")
-            time.sleep(1 + attempt * 0.5)
-    logger.error(f"Failed to fetch PyPI stats for {name} after {Config.MAX_RETRIES} attempts")
-    return 0, 0
+    response = requests.get(
+        url,
+        headers={"Accept": "application/json"},
+        timeout=Config.REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    stats = response.json().get("data", {})
+    return stats.get("last_day", 0), stats.get("last_month", 0)
 
-
+@retry(
+    stop=stop_after_attempt(Config.MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((requests.RequestException, ValueError))
+)
 def fetch_crates_downloads(crate: str) -> int:
     """Fetch download count for a Rust crate."""
-    try:
-        response = requests.get(
-            f"https://crates.io/api/v1/crates/{crate}",
-            timeout=Config.REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-        return response.json()["crate"]["downloads"]
-    except Exception as e:
-        logger.error(f"Failed to fetch crate downloads for {crate}: {e}")
-        return 0
-
+    response = requests.get(
+        f"https://crates.io/api/v1/crates/{crate}",
+        timeout=Config.REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    return response.json()["crate"]["downloads"]
 
 def fetch_pypi_packages(page, user: str) -> List[PackageData]:
     """Fetch package names for a PyPI user."""
@@ -107,12 +100,12 @@ def fetch_pypi_packages(page, user: str) -> List[PackageData]:
             "a.package-snippet h3.package-snippet__title",
             "els => els.map(el => el.textContent.trim())"
         )
+        logger.info(f"Fetched {len(names)} PyPI packages for user {user}")
         return [{"source": "pypi", "owner": user, "name": name}
                 for name in names if name]
     except Exception as e:
         logger.error(f"Failed to fetch PyPI packages for {user}: {e}")
         return []
-
 
 def fetch_pypi_data(users: List[str], page) -> List[PackageData]:
     """Fetch PyPI package data with download counts."""
@@ -135,7 +128,6 @@ def fetch_pypi_data(users: List[str], page) -> List[PackageData]:
                 pkg["downloads"] = 0
     return packages
 
-
 def fetch_rubygems_data(users: List[str]) -> List[PackageData]:
     """Fetch RubyGems package data."""
     results = []
@@ -146,7 +138,9 @@ def fetch_rubygems_data(users: List[str]) -> List[PackageData]:
                 timeout=Config.REQUEST_TIMEOUT
             )
             response.raise_for_status()
-            for gem in response.json():
+            gems = response.json()
+            logger.info(f"Fetched {len(gems)} RubyGems for user {user}")
+            for gem in gems:
                 results.append({
                     "source": "rubygems",
                     "owner": user,
@@ -157,7 +151,6 @@ def fetch_rubygems_data(users: List[str]) -> List[PackageData]:
         except Exception as e:
             logger.error(f"Failed to fetch RubyGems for {user}: {e}")
     return results
-
 
 def fetch_crates_data(users: List[str]) -> List[PackageData]:
     """Fetch Rust crates data."""
@@ -182,6 +175,7 @@ def fetch_crates_data(users: List[str]) -> List[PackageData]:
                         "els => els.map(e => e.innerText.trim())"
                     )
                     new_crates = [c for c in crates if c and c not in seen]
+                    logger.info(f"Fetched {len(new_crates)} crates for {user}, page {page_num}")
                     if not new_crates:
                         break
                     for name in new_crates:
@@ -207,15 +201,17 @@ def fetch_crates_data(users: List[str]) -> List[PackageData]:
                 crate["daily_downloads"] = None
     return results
 
-
 def fetch_github_release_downloads(token: str, orgs: List[str]) -> List[PackageData]:
-    """Fetch GitHub release download counts."""
+    """Fetch GitHub release download counts with pagination."""
     try:
         gh = Github(token)
         entries = []
         for org in orgs:
             try:
-                for repo in gh.get_organization(org).get_repos():
+                org_obj = gh.get_organization(org)
+                repos = org_obj.get_repos()
+                repo_count = 0
+                for repo in repos:
                     try:
                         total_dl = sum(asset.download_count
                                        for r in repo.get_releases()
@@ -227,8 +223,10 @@ def fetch_github_release_downloads(token: str, orgs: List[str]) -> List[PackageD
                             "downloads": total_dl,
                             "daily_downloads": None
                         })
+                        repo_count += 1
                     except Exception as e:
                         logger.error(f"Failed to process GitHub repo {org}/{repo.name}: {e}")
+                logger.info(f"Fetched {repo_count} GitHub repositories for {org}")
             except Exception as e:
                 logger.error(f"Failed to fetch GitHub org {org}: {e}")
         return entries
@@ -236,21 +234,18 @@ def fetch_github_release_downloads(token: str, orgs: List[str]) -> List[PackageD
         logger.error(f"Failed to initialize GitHub client: {e}")
         return []
 
-
 def compute_deltas(data: List[PackageData], prev_map: Dict[PackageKey, int]) -> List[PackageData]:
-    """Compute daily download deltas."""
+    """Compute daily download deltas with fallback for missing previous data."""
     for row in data:
         key = (row["source"], row["owner"], row["name"])
         current = int(row.get("downloads") or 0)
-        prev = prev_map.get(key)
+        prev = prev_map.get(key, 0)  # Default to 0 if no previous data
 
         if row["source"] == "pypi":
-            if prev is not None:
-                row["downloads"] = prev + row.get("daily_downloads", 0)
+            row["downloads"] = prev + row.get("daily_downloads", 0)
         else:
-            row["daily_downloads"] = max(current - prev, 0) if prev is not None else 0
+            row["daily_downloads"] = max(current - prev, 0)
     return data
-
 
 def upsert_into_supabase(supabase: Client, data: List[PackageData]) -> None:
     """Upsert package data into Supabase."""
@@ -275,7 +270,6 @@ def upsert_into_supabase(supabase: Client, data: List[PackageData]) -> None:
         logger.error(f"Failed to upsert into Supabase: {e}")
         raise
 
-
 def main():
     """Main function to collect and store package download statistics."""
     try:
@@ -297,12 +291,10 @@ def main():
         all_data.sort(key=itemgetter("source", "owner", "name"))
 
         upsert_into_supabase(supabase, all_data)
-        logger.info("Data collection and storage completed successfully")
+        logger.info(f"Data collection and storage completed successfully. Total rows: {len(all_data)}")
     except Exception as e:
         logger.error(f"Main execution failed: {e}")
         raise
 
-
 if __name__ == "__main__":
     main()
-
