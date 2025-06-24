@@ -1,109 +1,171 @@
 import os
 import time
-import requests
+import logging
+from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from operator import itemgetter
-from playwright.sync_api import sync_playwright
+import requests
 from github import Github
+from playwright.sync_api import sync_playwright
 from supabase import create_client, Client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-
-def fetch_latest_downloads_map():
-    yesterday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
-    response = supabase.table("downloads") \
-        .select("*") \
-        .eq("collected_at", yesterday) \
-        .execute()
-
-    latest = {}
-    for row in response.data:
-        key = (row["source"], row["owner"], row["name"])
-        latest[key] = int(row["downloads"])
-    return latest
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def fetch_pypistats_downloads(name):
+# Configuration
+class Config:
+    SUPABASE_URL = os.environ["SUPABASE_URL"]
+    SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+    GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+    USERS = ["asimov-platform", "asimov-modules"]
+    MAX_RETRIES = 3
+    REQUEST_TIMEOUT = 5
+    PAGE_LOAD_TIMEOUT = 10000
+    SELECTOR_TIMEOUT = 5000
+    MAX_WORKERS = 8
+
+
+# Type aliases
+PackageKey = Tuple[str, str, str]  # (source, owner, name)
+PackageData = Dict[str, any]
+
+
+def initialize_supabase() -> Client:
+    """Initialize and return Supabase client."""
+    if not Config.SUPABASE_URL or not Config.SUPABASE_KEY:
+        raise ValueError("Supabase URL and Key must be set in environment variables")
+    return create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
+
+
+def fetch_latest_downloads_map(supabase: Client) -> Dict[PackageKey, int]:
+    """Fetch yesterday's download counts from Supabase."""
+    try:
+        yesterday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+        response = supabase.table("downloads") \
+            .select("*") \
+            .eq("collected_at", yesterday) \
+            .execute()
+
+        return {
+            (row["source"], row["owner"], row["name"]): int(row["downloads"])
+            for row in response.data
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch latest downloads: {e}")
+        return {}
+
+
+def fetch_pypistats_downloads(name: str) -> Tuple[int, int]:
+    """Fetch PyPI download statistics for a package."""
     url = f"https://pypistats.org/api/packages/{name}/recent"
-    for attempt in range(3):
+    for attempt in range(Config.MAX_RETRIES):
         try:
-            r = requests.get(url, headers={"Accept": "application/json"}, timeout=5)
-            if r.ok:
-                stats = r.json().get("data", {})
-                return stats.get("last_day", 0), stats.get("last_month", 0)
-        except Exception:
-            pass
-        time.sleep(1 + attempt * 0.5)
+            response = requests.get(
+                url,
+                headers={"Accept": "application/json"},
+                timeout=Config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            stats = response.json().get("data", {})
+            return stats.get("last_day", 0), stats.get("last_month", 0)
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed for PyPI stats {name}: {e}")
+            time.sleep(1 + attempt * 0.5)
+    logger.error(f"Failed to fetch PyPI stats for {name} after {Config.MAX_RETRIES} attempts")
     return 0, 0
 
 
-def fetch_crates_downloads(crate):
+def fetch_crates_downloads(crate: str) -> int:
+    """Fetch download count for a Rust crate."""
     try:
-        r = requests.get(f"https://crates.io/api/v1/crates/{crate}", timeout=5)
-        if r.ok:
-            return r.json()["crate"]["downloads"]
-    except Exception:
-        pass
-    return 0
+        response = requests.get(
+            f"https://crates.io/api/v1/crates/{crate}",
+            timeout=Config.REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()["crate"]["downloads"]
+    except Exception as e:
+        logger.error(f"Failed to fetch crate downloads for {crate}: {e}")
+        return 0
 
 
-def fetch_pypi_packages(page, user):
-    url = f"https://pypi.org/user/{user}/"
+def fetch_pypi_packages(page, user: str) -> List[PackageData]:
+    """Fetch package names for a PyPI user."""
     try:
-        page.goto(url, wait_until="load", timeout=10000)
-        page.wait_for_selector("a.package-snippet", timeout=5000)
+        page.goto(f"https://pypi.org/user/{user}/",
+                  wait_until="load",
+                  timeout=Config.PAGE_LOAD_TIMEOUT)
+        page.wait_for_selector("a.package-snippet",
+                               timeout=Config.SELECTOR_TIMEOUT)
         names = page.eval_on_selector_all(
             "a.package-snippet h3.package-snippet__title",
             "els => els.map(el => el.textContent.trim())"
         )
-        return [{"source": "pypi", "owner": user, "name": name} for name in names if name]
-    except Exception:
+        return [{"source": "pypi", "owner": user, "name": name}
+                for name in names if name]
+    except Exception as e:
+        logger.error(f"Failed to fetch PyPI packages for {user}: {e}")
         return []
 
 
-def fetch_pypi_data(users, page):
+def fetch_pypi_data(users: List[str], page) -> List[PackageData]:
+    """Fetch PyPI package data with download counts."""
     packages = []
     for user in users:
         packages.extend(fetch_pypi_packages(page, user))
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_pypistats_downloads, pkg["name"]): pkg for pkg in packages}
+    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_pypistats_downloads, pkg["name"]): pkg
+                   for pkg in packages}
         for future in as_completed(futures):
             pkg = futures[future]
-            daily, monthly = future.result()
-            pkg["daily_downloads"] = daily
-            pkg["downloads"] = monthly
+            try:
+                daily, monthly = future.result()
+                pkg["daily_downloads"] = daily
+                pkg["downloads"] = monthly
+            except Exception as e:
+                logger.error(f"Error processing PyPI downloads for {pkg['name']}: {e}")
+                pkg["daily_downloads"] = 0
+                pkg["downloads"] = 0
     return packages
 
 
-def fetch_rubygems_data(users):
+def fetch_rubygems_data(users: List[str]) -> List[PackageData]:
+    """Fetch RubyGems package data."""
     results = []
     for user in users:
         try:
-            r = requests.get(f"https://rubygems.org/api/v1/owners/{user}/gems.json", timeout=5)
-            if r.ok:
-                for gem in r.json():
-                    results.append({
-                        "source": "rubygems",
-                        "owner": user,
-                        "name": gem["name"],
-                        "downloads": gem["downloads"]
-                    })
-        except Exception:
-            pass
+            response = requests.get(
+                f"https://rubygems.org/api/v1/owners/{user}/gems.json",
+                timeout=Config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            for gem in response.json():
+                results.append({
+                    "source": "rubygems",
+                    "owner": user,
+                    "name": gem["name"],
+                    "downloads": gem["downloads"],
+                    "daily_downloads": None
+                })
+        except Exception as e:
+            logger.error(f"Failed to fetch RubyGems for {user}: {e}")
     return results
 
 
-def fetch_crates_data(users):
+def fetch_crates_data(users: List[str]) -> List[PackageData]:
+    """Fetch Rust crates data."""
     results, seen = [], set()
     with sync_playwright() as p:
-        page = p.chromium.launch(headless=True).new_page()
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
         for user in users:
             page_num = 1
             while True:
@@ -111,51 +173,72 @@ def fetch_crates_data(users):
                 if page_num > 1:
                     url += f"?page={page_num}"
                 try:
-                    page.goto(url, wait_until="networkidle", timeout=10000)
-                    page.wait_for_selector("a[href^='/crates/']", timeout=5000)
-                except Exception:
+                    page.goto(url, wait_until="networkidle",
+                              timeout=Config.PAGE_LOAD_TIMEOUT)
+                    page.wait_for_selector("a[href^='/crates/']",
+                                           timeout=Config.SELECTOR_TIMEOUT)
+                    crates = page.eval_on_selector_all(
+                        "a[href^='/crates/']",
+                        "els => els.map(e => e.innerText.trim())"
+                    )
+                    new_crates = [c for c in crates if c and c not in seen]
+                    if not new_crates:
+                        break
+                    for name in new_crates:
+                        seen.add(name)
+                        results.append({"source": "crates", "owner": user, "name": name})
+                    page_num += 1
+                except Exception as e:
+                    logger.error(f"Failed to fetch crates for {user}, page {page_num}: {e}")
                     break
+        browser.close()
 
-                crates = page.eval_on_selector_all(
-                    "a[href^='/crates/']",
-                    "els => els.map(e => e.innerText.trim())"
-                )
-                new_crates = [c for c in crates if c and c not in seen]
-                if not new_crates:
-                    break
-                for name in new_crates:
-                    seen.add(name)
-                    results.append({"source": "crates", "owner": user, "name": name})
-                page_num += 1
-        page.context.close()
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_crates_downloads, crate["name"]): crate for crate in results}
+    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_crates_downloads, crate["name"]): crate
+                   for crate in results}
         for future in as_completed(futures):
             crate = futures[future]
-            crate["downloads"] = future.result()
+            try:
+                crate["downloads"] = future.result()
+                crate["daily_downloads"] = None
+            except Exception as e:
+                logger.error(f"Error processing crate downloads for {crate['name']}: {e}")
+                crate["downloads"] = 0
+                crate["daily_downloads"] = None
     return results
 
 
-def fetch_github_release_downloads(token, orgs):
-    gh = Github(token)
-    entries = []
-    for org in orgs:
-        for repo in gh.get_organization(org).get_repos():
+def fetch_github_release_downloads(token: str, orgs: List[str]) -> List[PackageData]:
+    """Fetch GitHub release download counts."""
+    try:
+        gh = Github(token)
+        entries = []
+        for org in orgs:
             try:
-                total_dl = sum(asset.download_count for r in repo.get_releases() for asset in r.get_assets())
-                entries.append({
-                    "source": "github",
-                    "owner": org,
-                    "name": repo.name,
-                    "downloads": total_dl,
-                    "daily_downloads": None
-                })
-            except Exception:
-                continue
-    return entries
+                for repo in gh.get_organization(org).get_repos():
+                    try:
+                        total_dl = sum(asset.download_count
+                                       for r in repo.get_releases()
+                                       for asset in r.get_assets())
+                        entries.append({
+                            "source": "github",
+                            "owner": org,
+                            "name": repo.name,
+                            "downloads": total_dl,
+                            "daily_downloads": None
+                        })
+                    except Exception as e:
+                        logger.error(f"Failed to process GitHub repo {org}/{repo.name}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to fetch GitHub org {org}: {e}")
+        return entries
+    except Exception as e:
+        logger.error(f"Failed to initialize GitHub client: {e}")
+        return []
 
 
-def compute_deltas(data, prev_map):
+def compute_deltas(data: List[PackageData], prev_map: Dict[PackageKey, int]) -> List[PackageData]:
+    """Compute daily download deltas."""
     for row in data:
         key = (row["source"], row["owner"], row["name"])
         current = int(row.get("downloads") or 0)
@@ -169,46 +252,55 @@ def compute_deltas(data, prev_map):
     return data
 
 
-def upsert_into_supabase(data):
-    collected_at = datetime.utcnow().date().isoformat()
-    payload = [
-        {
-            "source": row["source"],
-            "owner": row["owner"],
-            "name": row["name"],
-            "downloads": row.get("downloads", 0),
-            "daily_downloads": row.get("daily_downloads", 0),
-            "collected_at": collected_at
-        } for row in data
-    ]
-
-    supabase.table("downloads").upsert(
-        payload,
-        on_conflict="source, owner, name, collected_at"
-    ).execute()
+def upsert_into_supabase(supabase: Client, data: List[PackageData]) -> None:
+    """Upsert package data into Supabase."""
+    try:
+        collected_at = datetime.utcnow().date().isoformat()
+        payload = [
+            {
+                "source": row["source"],
+                "owner": row["owner"],
+                "name": row["name"],
+                "downloads": row.get("downloads", 0),
+                "daily_downloads": row.get("daily_downloads", 0),
+                "collected_at": collected_at
+            } for row in data
+        ]
+        supabase.table("downloads").upsert(
+            payload,
+            on_conflict="source,owner,name,collected_at"
+        ).execute()
+        logger.info(f"Inserted {len(payload)} rows into Supabase")
+    except Exception as e:
+        logger.error(f"Failed to upsert into Supabase: {e}")
+        raise
 
 
 def main():
-    users = ["asimov-platform", "asimov-modules"]
-    all_data = []
-    prev_map = fetch_latest_downloads_map()
+    """Main function to collect and store package download statistics."""
+    try:
+        supabase = initialize_supabase()
+        prev_map = fetch_latest_downloads_map(supabase)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        all_data.extend(fetch_pypi_data(users, page))
-        page.context.close()
-        browser.close()
+        all_data = []
+        all_data.extend(fetch_rubygems_data(Config.USERS))
+        all_data.extend(fetch_crates_data(Config.USERS))
+        all_data.extend(fetch_github_release_downloads(Config.GITHUB_TOKEN, Config.USERS))
 
-    all_data.extend(fetch_rubygems_data(users))
-    all_data.extend(fetch_crates_data(users))
-    all_data.extend(fetch_github_release_downloads(GITHUB_TOKEN, users))
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            all_data.extend(fetch_pypi_data(Config.USERS, page))
+            browser.close()
 
-    compute_deltas(all_data, prev_map)
-    all_data.sort(key=itemgetter("source", "owner", "name"))
+        all_data = compute_deltas(all_data, prev_map)
+        all_data.sort(key=itemgetter("source", "owner", "name"))
 
-    upsert_into_supabase(all_data)
-    print(f"✅ Inserted {len(all_data)} rows into Supabase")
+        upsert_into_supabase(supabase, all_data)
+        logger.info("Data collection and storage completed successfully")
+    except Exception as e:
+        logger.error(f"Main execution failed: {e}")
+        raise
 
 
 if __name__ == "__main__":
